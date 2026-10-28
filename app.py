@@ -1,146 +1,314 @@
-from flask import Flask, request, jsonify
+
+import os
+import logging
+from datetime import datetime, timezone
+
 import requests
-from datetime import datetime
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# --- आपकी सेटिंग्स ---
-
-ACCESS_TOKEN = "EAA6dqbdecDUBSzNcGPEPaa6DcoEeOrj7yoTxCYWIXbXiS1pFWv4qfdA9NAmtwYFq7ZCFCcf2dm8sqAjp25nrr67XZCTmjviAJie97ScwGdDdJRRniCW1oW8mx7czjCujcGhdiUZCfmZAgNiQnQUkqCZCtzoE8D1MotfQppAu14Ur9FAwHfkUESucYfHqQ2aj9Br0a0PdTtZAXl8vICPHz5YwYYEnR7hi5Le50LKV7gQQWoUpy3RTxsfAxBPCew6eZBl9fORb1urgNtotZAUHAtEznh09"
-
-PHONE_NUMBER_ID = "1365015290033149"
-
-VERIFY_TOKEN = "tpc_bot_123"
-
-GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbzo7QpzK5bHIbVhhXCLrlEzd0SxItRP4iO9oIbwjA2hYwVnpbMvfHDe6ZeodcLx0Jfl/exec"
+# Render Environment Variables se settings
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "").strip()
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "").strip()
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "").strip()
+GOOGLE_SHEET_URL = os.getenv("GOOGLE_SHEET_URL", "").strip()
+GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v23.0").strip()
 
 
 def save_to_google_sheet(phone, name, ad_type, message):
-    """Google Drive की शीट में डेटा अपने-आप जोड़ना"""
+    """Incoming message ko Google Sheet mein save kare."""
+    if not GOOGLE_SHEET_URL:
+        logging.error("GOOGLE_SHEET_URL is missing")
+        return False
+
+    now = datetime.now(timezone.utc).astimezone()
+
+    payload = {
+        "date": now.strftime("%d-%m-%Y"),
+        "time": now.strftime("%H:%M:%S"),
+        "name": name,
+        "phone": phone,
+        "ad": ad_type,
+        "message": message
+    }
+
     try:
-        payload = {
-            "date": datetime.now().strftime("%d-%m-%Y"),
-            "time": datetime.now().strftime("%H:%M:%S"),
-            "name": name,
-            "phone": phone,
-            "ad": ad_type,
-            "message": message
-        }
-        requests.post(GOOGLE_SHEET_URL, json=payload, timeout=8)
-    except Exception as e:
-        print(f"Sheet Save Error: {e}")
+        response = requests.post(
+            GOOGLE_SHEET_URL,
+            json=payload,
+            timeout=15
+        )
+
+        logging.info(
+            "GOOGLE SHEET STATUS: %s",
+            response.status_code
+        )
+        response.raise_for_status()
+        return True
+
+    except requests.RequestException as e:
+        logging.error("Google Sheet save failed: %s", str(e))
+        return False
 
 
 def send_whatsapp_reply(to_phone, text):
-    """WhatsApp पर मैसेज भेजना"""
-    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+    """WhatsApp Cloud API se reply bheje."""
+    if not ACCESS_TOKEN or not PHONE_NUMBER_ID:
+        logging.error("ACCESS_TOKEN or PHONE_NUMBER_ID is missing")
+        return False
+
+    url = (
+        f"https://graph.facebook.com/{GRAPH_API_VERSION}/"
+        f"{PHONE_NUMBER_ID}/messages"
+    )
+
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
         "Content-Type": "application/json"
     }
+
     payload = {
         "messaging_product": "whatsapp",
+        "recipient_type": "individual",
         "to": to_phone,
         "type": "text",
         "text": {"body": text}
     }
-    requests.post(url, headers=headers, json=payload)
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=20
+        )
+
+        logging.info(
+            "WHATSAPP REPLY STATUS: %s",
+            response.status_code
+        )
+        logging.info(
+            "WHATSAPP REPLY RESPONSE: %s",
+            response.text
+        )
+
+        response.raise_for_status()
+        return True
+
+    except requests.RequestException as e:
+        logging.error("WhatsApp reply failed: %s", str(e))
+        return False
+
+
+def get_message_text(message):
+    """Text aur interactive button/list replies ko samjhe."""
+    msg_type = message.get("type", "")
+
+    if msg_type == "text":
+        return message.get("text", {}).get("body", "")
+
+    if msg_type == "button":
+        return message.get("button", {}).get("text", "")
+
+    if msg_type == "interactive":
+        interactive = message.get("interactive", {})
+
+        button_reply = interactive.get("button_reply", {})
+        if button_reply:
+            return (
+                button_reply.get("title")
+                or button_reply.get("id", "")
+            )
+
+        list_reply = interactive.get("list_reply", {})
+        if list_reply:
+            return (
+                list_reply.get("title")
+                or list_reply.get("id", "")
+            )
+
+    return ""
+
+
+def create_reply(user_name, incoming_text, ad_headline=""):
+    """Keyword ke hisaab se automatic reply banaye."""
+    context = f"{incoming_text} {ad_headline}".lower()
+
+    if any(k in context for k in [
+        "test series", "टेस्ट", "mock", "test"
+    ]):
+        category = "Test Series Ad"
+        reply = (
+            f"नमस्ते {user_name} जी! 🙏\n\n"
+            "The Prime Classes की टेस्ट सीरीज़ में रुचि "
+            "दिखाने के लिए धन्यवाद।\n"
+            "आप किस कक्षा की टेस्ट सीरीज़ चाहते हैं?\n\n"
+            "1. कक्षा 6\n"
+            "2. कक्षा 9\n\n"
+            "कृपया 1 या 2 लिखकर जवाब दें।"
+        )
+
+    elif any(k in context for k in [
+        "admission", "batch", "आरंभ", "aarambh", "class",
+        "एडमिशन", "फीस"
+    ]):
+        category = "Admission / Course Ad"
+        reply = (
+            f"नमस्ते {user_name} जी! 🙏\n\n"
+            "The Prime Classes में संपर्क करने के लिए धन्यवाद।\n"
+            "आपको हमारे आरंभ बैच और एडमिशन की जानकारी "
+            "दी जाएगी।\n\n"
+            "कृपया छात्र की कक्षा (6 या 9) और शहर का नाम बताएं।"
+        )
+
+    else:
+        category = "सामान्य पूछताछ"
+        reply = (
+            f"नमस्ते {user_name} जी! 🙏\n\n"
+            "The Prime Classes में आपका स्वागत है।\n"
+            "आप किस परीक्षा की जानकारी चाहते हैं?\n\n"
+            "1. Sainik School AISSEE\n"
+            "2. RMS CET\n"
+            "3. RIMC\n"
+            "4. Navodaya\n\n"
+            "कृपया परीक्षा का नाम या नंबर लिखें।"
+        )
+
+    return category, reply
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "status": "running",
+        "service": "WhatsApp Bot"
+    }), 200
 
 
 @app.route("/webhook", methods=["GET"])
-def verify():
+def verify_webhook():
+    """Meta webhook verification."""
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
 
-    if mode == "subscribe" and token == VERIFY_TOKEN:
+    if (
+        mode == "subscribe"
+        and VERIFY_TOKEN
+        and token == VERIFY_TOKEN
+        and challenge
+    ):
+        logging.info("Webhook verification successful")
         return challenge, 200
 
-    return "Verification token mismatch", 403
+    logging.warning("Webhook verification failed")
+    return "Verification failed", 403
 
 
 @app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json()
+def receive_webhook():
+    """Meta se incoming WhatsApp events receive kare."""
+    data = request.get_json(silent=True) or {}
+
+    if not data.get("entry"):
+        logging.info("Webhook event received without message entries")
+        return jsonify({"status": "received"}), 200
 
     try:
-        if data.get("entry"):
-            for entry in data["entry"]:
-                for change in entry.get("changes", []):
-                    val = change.get("value", {})
-                    messages = val.get("messages", [])
-                    contacts = val.get("contacts", [])
+        for entry in data.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
 
-                    if messages:
-                        msg = messages[0]
-                        sender_phone = msg.get("from")
-                        user_name = contacts[0].get("profile", {}).get(
-                            "name", "विद्यार्थी/अभिभावक"
-                        ) if contacts else "विद्यार्थी"
+                # Delivery/read status events ko reply na karein.
+                messages = value.get("messages", [])
+                contacts = value.get("contacts", [])
 
-                        incoming_text = msg.get("text", {}).get("body", "")
+                if not messages:
+                    continue
 
-                        # विज्ञापन (Ad Headline) ट्रैक करना
-                        ad_headline = ""
-                        if "referral" in msg:
-                            ad_headline = msg["referral"].get("headline", "")
+                contact_map = {
+                    c.get("wa_id"): c
+                    for c in contacts
+                    if c.get("wa_id")
+                }
 
-                        context = f"{incoming_text} {ad_headline}".lower()
+                for message in messages:
+                    sender_phone = message.get("from", "")
+                    message_id = message.get("id", "")
+                    message_type = message.get("type", "")
 
-                        # विज्ञापन के अनुसार स्मार्ट रिप्लाई
-                        if any(k in context for k in [
-                            "test series", "टेस्ट", "mock", "test"
-                        ]):
-                            ad_category = "Test Series Ad"
-                            reply = (
-                                f"नमस्ते {user_name} जी! 🙏\n\n"
-                                "The Prime Classes की टेस्ट सीरीज़ में रुचि "
-                                "दिखाने के लिए धन्यवाद।\n"
-                                "हमारी ऑल-इंडिया टेस्ट सीरीज़ पूर्णतः "
-                                "नवीनतम पैटर्न पर आधारित है।\n\n"
-                                "आप किस कक्षा (कक्षा 6 या कक्षा 9) की "
-                                "टेस्ट सीरीज़ चाहते हैं? कृपया रिप्लाई करें।"
-                            )
-
-                        elif any(k in context for k in [
-                            "admission", "batch", "आरंभ", "aarambh", "class"
-                        ]):
-                            ad_category = "Admission / Course Ad"
-                            reply = (
-                                f"नमस्ते {user_name} जी! 🙏\n\n"
-                                "The Prime Classes के 'आरंभ बैच' की जानकारी "
-                                "के लिए धन्यवाद।\n"
-                                "हमारे बैच में संपूर्ण सिलेबस की लाइव "
-                                "कक्षाएं और नोट्स शामिल हैं।\n\n"
-                                "हमारी टीम शीघ्र ही आपसे संपर्क करेगी। "
-                                "कृपया अपना शहर और छात्र का नाम दर्ज करें।"
-                            )
-
-                        else:
-                            ad_category = "सामान्य पूछताछ"
-                            reply = (
-                                f"नमस्ते {user_name} जी! 🙏\n\n"
-                                "The Prime Classes में संपर्क करने के लिए धन्यवाद।\n"
-                                "कृपया बताएँ आप किस प्रवेश परीक्षा "
-                                "(Sainik School / RMS / RIMC) की जानकारी चाहते हैं?"
-                            )
-
-                        # 1. Google Drive की शीट में सेव करें
-                        save_to_google_sheet(
-                            sender_phone,
-                            user_name,
-                            ad_category,
-                            incoming_text
+                    if not sender_phone or not message_id:
+                        logging.warning(
+                            "Message missing sender or message ID"
                         )
+                        continue
 
-                        # 2. WhatsApp ऑटो-रिप्लाई भेजें
-                        send_whatsapp_reply(sender_phone, reply)
+                    incoming_text = get_message_text(message).strip()
 
-    except Exception as e:
-        print(f"Webhook Error: {e}")
+                    contact = contact_map.get(sender_phone, {})
+                    profile = contact.get("profile", {})
+                    user_name = (
+                        profile.get("name")
+                        or "विद्यार्थी/अभिभावक"
+                    )
 
+                    # Ad referral information, if available
+                    referral = message.get("referral", {})
+                    ad_headline = referral.get("headline", "")
+
+                    if referral:
+                        ad_category = (
+                            "Click-to-WhatsApp Ad: "
+                            + (ad_headline or "Referral received")
+                        )
+                    else:
+                        ad_category = "सामान्य पूछताछ"
+
+                    logging.info(
+                        "Incoming message received; type=%s",
+                        message_type
+                    )
+
+                    if not incoming_text:
+                        logging.info(
+                            "Non-text message received; no auto-reply"
+                        )
+                        continue
+
+                    keyword_category, reply = create_reply(
+                        user_name,
+                        incoming_text,
+                        ad_headline
+                    )
+
+                    if not referral:
+                        ad_category = keyword_category
+
+                    # 1. Save incoming message to Google Sheet
+                    save_to_google_sheet(
+                        sender_phone,
+                        user_name,
+                        ad_category,
+                        incoming_text
+                    )
+
+                    # 2. Send automatic WhatsApp reply
+                    send_whatsapp_reply(
+                        sender_phone,
+                        reply
+                    )
+
+    except Exception:
+        logging.exception("Webhook processing error")
+
+    # Meta ko acknowledgement bhejein
     return jsonify({"status": "received"}), 200
 
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "10000"))
+    )
